@@ -1,0 +1,34 @@
+import { Palette, Button, ComboBox, GroupBox, GridBox, Slider, HorizontalBox, VerticalBox, ProgressIndicator } from "std-widgets.slint";
+export component AppWindow inherits Window {
+    in property <image> texture <=> i.source;
+    out property <length> requested-texture-width: i.width;
+    out property <length> requested-texture-height: i.height;
+    title: @tr("Slint & Vello");
+    preferred-width: 500px;
+    preferred-height: 600px;
+    VerticalBox {
+        Text {
+            height: 30px;
+            text: "Slint & Vello";
+            font-size: 24px;
+            horizontal-alignment: center;
+        }
+
+        Rectangle {
+            background: red;
+            width: 100%;
+            i := Image {
+                image-fit: fill;
+                width: 100%;
+                height: 100%;
+                Text {
+                    text: "Overlayed Text";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    font-size: 24px;
+                    color: white;
+                }
+            }
+        }
+    }
+}
