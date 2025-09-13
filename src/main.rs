@@ -58,7 +58,8 @@ impl VelloRenderer {
             format: TextureFormat::Rgba8Unorm,
             usage: TextureUsages::RENDER_ATTACHMENT
                 | TextureUsages::STORAGE_BINDING
-                | TextureUsages::COPY_SRC,
+                | TextureUsages::COPY_SRC
+                | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
     }
@@ -231,8 +232,9 @@ async fn main() -> anyhow::Result<()> {
                     // pixel_buffer.make_mut_slice().copy_from_slice(source_slice);
                     // let slint_image = Image::from_rgba8(pixel_buffer);
 
-                    let texture = &renderer.render_texture;
-                    let slint_image = slint::Image::try_from(texture).unwrap();
+                    let texture = renderer.render_texture.clone();
+                    let slint_image = slint::Image::try_from(texture)
+                        .expect("Failed to create Slint image from texture");
 
                     app.set_texture(slint_image);
                     app.window().request_redraw();
