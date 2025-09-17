@@ -1,53 +1,41 @@
 slint::include_modules!();
 
-use anyhow::{Result, anyhow, bail};
-use std::cell::RefCell;
-use std::rc::Rc;
-use vello::kurbo::{Affine, Circle, Ellipse, Line, RoundedRect, Stroke};
-use vello::peniko::color::palette;
+use anyhow::{Result, anyhow};
+use slint::wgpu_26::{WGPUConfiguration, WGPUSettings, wgpu};
+use std::time::Instant;
+use vello::kurbo::{Affine, Arc, Circle, Point, Stroke};
 use vello::peniko::{Color, Fill};
-use vello::util::{RenderContext, block_on_wgpu};
-use vello::wgpu::{
-    self, BufferDescriptor, BufferUsages, CommandEncoderDescriptor, Extent3d, TexelCopyBufferInfo,
-    TexelCopyBufferLayout, TextureDescriptor, TextureFormat, TextureUsages,
-};
 use vello::{AaConfig, RenderParams, Renderer, RendererOptions, Scene};
 
 struct VelloRenderer {
-    context: RenderContext,
     scene: Scene,
-    device_id: usize,
     renderer: Renderer,
-    render_texture: wgpu::Texture,
+    render_textures: [vello::wgpu::Texture; 2],
+    current_idx: usize,
     width: u32,
     height: u32,
 }
 
 impl VelloRenderer {
-    async fn new(width: u32, height: u32) -> Result<Self> {
-        let mut context = RenderContext::new();
-        let device_id = context
-            .device(None)
-            .await
-            .ok_or_else(|| anyhow!("No compatible device found"))?;
-        let device = &context.devices[device_id].device;
-        let renderer =
-            Renderer::new(device, RendererOptions::default()).expect("Couldn't create renderer");
-        let render_texture = Self::create_render_texture(device, width, height);
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, width: u32, height: u32) -> Result<Self> {
         Ok(Self {
-            context,
             scene: Scene::new(),
-            device_id,
-            renderer,
-            render_texture,
+            renderer: Renderer::new(device, RendererOptions::default())
+                .expect("Couldn't create renderer"),
+            render_textures: [
+                Self::create_render_texture(device, width, height),
+                Self::create_render_texture(device, width, height),
+            ],
+            current_idx: 0,
             width,
             height,
         })
     }
+
     fn create_render_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
-        device.create_texture(&TextureDescriptor {
+        device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Vello Render Texture"),
-            size: Extent3d {
+            size: wgpu::Extent3d {
                 width,
                 height,
                 depth_or_array_layers: 1,
@@ -55,129 +43,145 @@ impl VelloRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::RENDER_ATTACHMENT
-                | TextureUsages::STORAGE_BINDING
-                | TextureUsages::COPY_SRC
-                | TextureUsages::TEXTURE_BINDING,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
     }
-    fn resize(&mut self, width: u32, height: u32) {
+
+    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self.width == width && self.height == height {
             return;
         }
         self.width = width;
         self.height = height;
-        let device = &self.context.devices[self.device_id].device;
-        self.render_texture = Self::create_render_texture(device, width, height);
+        self.render_textures = [
+            Self::create_render_texture(device, width, height),
+            Self::create_render_texture(device, width, height),
+        ];
     }
-    fn render(&mut self) -> Result<()> {
-        let device_handle = &self.context.devices[self.device_id];
-        let device = &device_handle.device;
-        let queue = &device_handle.queue;
-        let view = self
-            .render_texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+
+    fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<wgpu::Texture> {
+        self.current_idx = 1 - self.current_idx;
+
+        let texture_to_render_to = &self.render_textures[self.current_idx];
+        let view = texture_to_render_to.create_view(&wgpu::TextureViewDescriptor::default());
+
         let render_params = RenderParams {
-            base_color: palette::css::DARK_SLATE_BLUE,
-            width: self.width,
-            height: self.height,
+            base_color: Color::from_rgb8(20, 25, 40),
+            width: texture_to_render_to.size().width,
+            height: texture_to_render_to.size().height,
             antialiasing_method: AaConfig::Area,
         };
+
         self.renderer
             .render_to_texture(device, queue, &self.scene, &view, &render_params)
-            .map_err(|e| anyhow!("Error rendering to texture: {}", e))
-    }
-    fn read_texture_data(&self) -> Result<Vec<u8>> {
-        let device_handle = &self.context.devices[self.device_id];
-        let device = &device_handle.device;
-        let queue = &device_handle.queue;
-        let padded_byte_width = (self.width * 4).next_multiple_of(256);
-        let buffer_size = (padded_byte_width * self.height) as u64;
-        let output_buffer = device.create_buffer(&BufferDescriptor {
-            label: Some("Vello Output Buffer"),
-            size: buffer_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("Vello Copy Encoder"),
-        });
-        encoder.copy_texture_to_buffer(
-            self.render_texture.as_image_copy(),
-            TexelCopyBufferInfo {
-                buffer: &output_buffer,
-                layout: TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_byte_width),
-                    rows_per_image: None,
-                },
-            },
-            self.render_texture.size(),
-        );
-        queue.submit(Some(encoder.finish()));
-        let buf_slice = output_buffer.slice(..);
-        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        buf_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-        if let Some(recv_result) = block_on_wgpu(device, receiver.receive()) {
-            recv_result?;
-        } else {
-            bail!("GPU readback channel was closed.");
-        }
-        let data = buf_slice.get_mapped_range();
-        let mut image_data = Vec::with_capacity((self.width * self.height * 4) as usize);
-        for row in data.chunks(padded_byte_width as usize) {
-            image_data.extend_from_slice(&row[..(self.width * 4) as usize]);
-        }
-        drop(data);
-        output_buffer.unmap();
-        Ok(image_data)
+            .map_err(|e| anyhow!("Error rendering to texture: {}", e))?;
+
+        Ok(texture_to_render_to.clone())
     }
 }
 
-fn add_shapes_to_scene(scene: &mut Scene) {
-    let stroke = Stroke::new(6.0);
-    let rect = RoundedRect::new(10.0, 10.0, 240.0, 240.0, 20.0);
+fn update_scene(scene: &mut Scene, time: f64, width: u32, height: u32) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    const SLINT_BLUE: Color = Color::new([0.137, 0.475, 0.957, 1.0]);
+    const GRID_WHITE: Color = Color::new([0.94, 0.94, 0.94, 0.5]);
+
+    let center = Point::new(width as f64 / 2.0, height as f64 / 2.0);
+    let stroke_width = 8.0;
+
+    let grid_spacing = 40.0;
+    let grid_range_x = (width as f64 / grid_spacing / 2.0).ceil() as i32 + 2;
+    let grid_range_y = (height as f64 / grid_spacing / 2.0).ceil() as i32 + 2;
+    for i in -grid_range_x..=grid_range_x {
+        for j in -grid_range_y..=grid_range_y {
+            let pos = center + (i as f64 * grid_spacing, j as f64 * grid_spacing);
+            let dist = pos.distance(center);
+            let ripple = (dist * 0.05 - time * 2.0).sin();
+            let radius = (ripple * 1.5).max(0.0);
+            if radius > 0.1 {
+                scene.fill(
+                    Fill::NonZero,
+                    Affine::IDENTITY,
+                    GRID_WHITE,
+                    None,
+                    &Circle::new(pos, radius),
+                );
+            }
+        }
+    }
+
+    let arc_sweep_angle = std::f64::consts::PI * 1.5;
+
+    let radius1 = 60.0 + (time * 2.0).sin() * 5.0;
+    let arc1 = Arc::new(Point::ZERO, (radius1, radius1), 0.0, arc_sweep_angle, 0.0);
+    let transform1 = Affine::translate(center.to_vec2()) * Affine::rotate(time * 1.2);
     scene.stroke(
-        &stroke,
-        Affine::IDENTITY,
-        Color::new([0.9804, 0.702, 0.5294, 1.0]),
+        &Stroke::new(stroke_width),
+        transform1,
+        SLINT_BLUE,
         None,
-        &rect,
+        &arc1,
     );
-    let circle = Circle::new((420.0, 200.0), 120.0);
-    scene.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        Color::new([0.9529, 0.5451, 0.6588, 1.0]),
-        None,
-        &circle,
-    );
-    let ellipse = Ellipse::new((250.0, 420.0), (100.0, 160.0), -90.0);
-    scene.fill(
-        Fill::NonZero,
-        Affine::IDENTITY,
-        Color::new([0.7961, 0.651, 0.9686, 1.0]),
-        None,
-        &ellipse,
-    );
-    let line = Line::new((260.0, 20.0), (620.0, 100.0));
+
+    let radius2 = 90.0 + (time * 2.0 + 1.0).sin() * 8.0;
+    let arc2 = Arc::new(Point::ZERO, (radius2, radius2), 0.0, arc_sweep_angle, 0.0);
+    let transform2 = Affine::translate(center.to_vec2()) * Affine::rotate(-time * 0.8);
     scene.stroke(
-        &stroke,
-        Affine::IDENTITY,
-        Color::new([0.5373, 0.7059, 0.9804, 1.0]),
+        &Stroke::new(stroke_width),
+        transform2,
+        SLINT_BLUE.with_alpha(0.7),
         None,
-        &line,
+        &arc2,
+    );
+
+    let radius3 = 120.0 + (time * 2.0 + 2.0).sin() * 10.0;
+    let arc3 = Arc::new(Point::ZERO, (radius3, radius3), 0.0, arc_sweep_angle, 0.0);
+    let transform3 = Affine::translate(center.to_vec2()) * Affine::rotate(time * 0.5);
+    scene.stroke(
+        &Stroke::new(stroke_width),
+        transform3,
+        SLINT_BLUE.with_alpha(0.4),
+        None,
+        &arc3,
     );
 }
-use slint::wgpu_26::{WGPUConfiguration, WGPUSettings};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let mut wgpu_settings = WGPUSettings::default();
-    wgpu_settings.device_required_features = slint::wgpu_26::wgpu::Features::PUSH_CONSTANTS;
-    wgpu_settings.device_required_limits.max_push_constant_size = 16;
+    wgpu_settings.device_required_features = slint::wgpu_26::wgpu::Features::PUSH_CONSTANTS
+        | slint::wgpu_26::wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+    wgpu_settings.device_required_limits = slint::wgpu_26::wgpu::Limits {
+        max_push_constant_size: 128,
+        ..Default::default()
+    };
+    wgpu_settings.power_preference = wgpu::PowerPreference::HighPerformance;
+    wgpu_settings
+        .device_required_limits
+        .max_storage_buffers_per_shader_stage = 8;
+    wgpu_settings
+        .device_required_limits
+        .max_compute_workgroup_size_x = 256;
+    wgpu_settings
+        .device_required_limits
+        .max_compute_workgroup_size_y = 256;
+    wgpu_settings
+        .device_required_limits
+        .max_compute_workgroup_size_z = 64;
+    wgpu_settings
+        .device_required_limits
+        .max_compute_invocations_per_workgroup = 256;
+    wgpu_settings
+        .device_required_limits
+        .max_storage_textures_per_shader_stage = 4;
+    wgpu_settings
+        .device_required_limits
+        .max_storage_buffer_binding_size = 134_217_728;
 
     slint::BackendSelector::new()
         .require_wgpu_26(WGPUConfiguration::Automatic(wgpu_settings))
@@ -187,71 +191,61 @@ async fn main() -> anyhow::Result<()> {
     let app_window = AppWindow::new()?;
     let app_weak = app_window.as_weak();
 
-    let mut width = app_window.get_requested_texture_width() as u32;
-    let mut height = app_window.get_requested_texture_height() as u32;
-    if width == 0 || height == 0 {
-        width = 1;
-        height = 1;
-    }
+    let mut underlay: Option<VelloRenderer> = None;
 
-    let vello_renderer = Rc::new(RefCell::new(VelloRenderer::new(width, height).await?));
-
-    let mut frame_count = 0;
-    let mut last_sec = std::time::Instant::now();
-
-    {
-        let mut renderer = vello_renderer.borrow_mut();
-        renderer.scene.reset();
-        add_shapes_to_scene(&mut renderer.scene);
-    }
+    let start_time = Instant::now();
 
     app_window
         .window()
-        .set_rendering_notifier(move |state, _| match state {
+        .set_rendering_notifier(move |state, graphics_api| match state {
+            slint::RenderingState::RenderingSetup => {
+                let slint::GraphicsAPI::WGPU26 { device, queue, .. } = graphics_api else {
+                    return;
+                };
+                let renderer = VelloRenderer::new(device, queue, 1, 1).unwrap();
+                underlay = Some(renderer);
+            }
             slint::RenderingState::BeforeRendering => {
-                if let Some(app) = app_weak.upgrade() {
-                    let mut renderer = vello_renderer.borrow_mut();
+                let Some(app) = app_weak.upgrade() else {
+                    return;
+                };
+                let slint::GraphicsAPI::WGPU26 { device, queue, .. } = graphics_api else {
+                    return;
+                };
+                let Some(renderer) = &mut underlay else {
+                    return;
+                };
 
-                    let new_width = app.get_requested_texture_width() as u32;
-                    let new_height = app.get_requested_texture_height() as u32;
+                let new_width = app.get_requested_texture_width() as u32;
+                let new_height = app.get_requested_texture_height() as u32;
 
-                    if new_width > 0 && new_height > 0 {
-                        renderer.resize(new_width, new_height);
-                    } else {
-                        return;
-                    }
-
-                    renderer.render().expect("Vello rendering failed");
-
-                    // Temporary hack texture GPU -> CPU -> GPU
-                    // use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
-                    // let image_data = renderer.read_texture_data().unwrap();
-                    // let mut pixel_buffer =
-                    //     SharedPixelBuffer::<Rgba8Pixel>::new(renderer.width, renderer.height);
-                    // let source_slice: &[Rgba8Pixel] = bytemuck::cast_slice(&image_data);
-                    // pixel_buffer.make_mut_slice().copy_from_slice(source_slice);
-                    // let slint_image = Image::from_rgba8(pixel_buffer);
-
-                    let texture = renderer.render_texture.clone();
-                    let slint_image = slint::Image::try_from(texture)
-                        .expect("Failed to create Slint image from texture");
-
-                    app.set_texture(slint_image);
-                    app.window().request_redraw();
+                if new_width > 0 && new_height > 0 {
+                    renderer.resize(device, new_width, new_height);
+                } else {
+                    return;
                 }
 
-                frame_count += 1;
-                let now = std::time::Instant::now();
-                if now.duration_since(last_sec).as_secs() >= 1 {
-                    println!("FPS: {}", frame_count);
-                    frame_count = 0;
-                    last_sec = now;
-                }
+                let time = start_time.elapsed().as_secs_f64();
+
+                renderer.scene.reset();
+
+                update_scene(&mut renderer.scene, time, new_width, new_height);
+
+                let texture_for_slint = renderer
+                    .render(device, queue)
+                    .expect("Vello rendering failed");
+
+                let slint_image = slint::Image::try_from(texture_for_slint)
+                    .expect("Failed to create Slint image from texture");
+
+                app.set_texture(slint_image);
+                app.window().request_redraw();
+            }
+            slint::RenderingState::RenderingTeardown => {
+                underlay = None;
             }
             _ => {}
         })?;
-
-    app_window.window().request_redraw();
 
     app_window.run()?;
 
