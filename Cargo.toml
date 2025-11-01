@@ -10,7 +10,7 @@ anyhow = "1.0"
 tokio = { version = "1.47", features = ["full"] }
 slint = { git = "https://github.com/slint-ui/slint.git", branch = "master", features = [
 	"renderer-skia",
-	"unstable-wgpu-26",
+	"unstable-wgpu-27",
 ] }
 bytemuck = "1.23.2"
 futures-intrusive = "0.5.0"
